@@ -8,10 +8,10 @@ Run with -h or -help to recieve a help message on usage
 
 Usage:
 For hiding 
-project.py -hide -cover <cover image> -message <message image>
+steg.py -hide -cover <cover image> -message <message image>
 
 For extracting
-project.py -extract <image>
+steg.py -extract <image>
 
 Tech Write-up / basic idea
 Hiding - message image is scanned and the two colors are counted - the lower count is returned
