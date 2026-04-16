@@ -1,0 +1,11 @@
+[project]
+name = "steganography"
+version = "0.1.0"
+description = "Hide a message image inside a cover image using pixel value threshold steganography"
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=11.0",
+]
+
+[project.scripts]
+steg = "steg:main"
