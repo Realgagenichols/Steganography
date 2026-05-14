@@ -1,6 +1,9 @@
 from PIL import Image
 from sys import argv
- 
+
+if len(argv) != 5:
+    print("Usage: python genImage.py <red> <green> <blue> <name>")
+    raise SystemExit(1)
 
 red = argv[1]
 green = argv[2]
@@ -18,10 +21,10 @@ imArr = []
 size = (1920,1080)
 
 for i in colorArr:
-        r1,g1,b1 = i
-        imArr.append(r1)
-        imArr.append(g1)
-        imArr.append(b1)
+    r1,g1,b1 = i
+    imArr.append(r1)
+    imArr.append(g1)
+    imArr.append(b1)
 
 bytesArr = bytes(imArr)
 newImage = Image.frombytes("RGB", size, bytesArr)

@@ -9,3 +9,20 @@ dependencies = [
 
 [project.scripts]
 steg = "steg:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["steg.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+exclude = ["legacy"]
+

@@ -1,498 +1,246 @@
-# Written by Gage Nichols
+"""Threshold-based image steganography.
 
-from PIL import Image # need to install pillow library for this to work
-from sys import argv
-#import numpy as np
-#from math import sqrt
+Hides a message image inside a cover image by manipulating the lowest bits
+of pixel channel values relative to a threshold. The cover is normalized so
+the low bits of all channels >= n, then message foreground pixels get one
+channel's low bits reduced below n. Extraction checks for any channel whose
+low bits fall below n.
 
-#############################################
-#
-# input - 2 color image
-#
-# Counts the number of pixels for 
-# each of the two colors in the image. 
-# Works for arbitrary colors and file 
-# formats no need to be just B&W
-#
-# returns the one with the smaller count
-# to use to be hidden and the count
-#
-#############################################
-def countPixels(image):
+Because only the lowest few bits are modified, the maximum change per channel
+is small (e.g., 7 for 3-bit depth), making the hidden message imperceptible.
+"""
 
-    color1, color2 = 0, 0
+from __future__ import annotations
 
-    # grab a pixel and store its color
-    firstColor = image.getdata()[1]
+import argparse
+import logging
+import math
+from pathlib import Path
 
-    # find a pixel of a different color 
-    for pixel in image.getdata():
+from PIL import Image
 
-        if pixel != firstColor:
-            secondColor = pixel
-            break
+DEFAULT_THRESHOLD = 5
+BINARIZE_CUTOFF = 128
 
-    # count the pixels of each color
-    for pixel in image.getdata():
-
-        if pixel == firstColor:
-            color1 += 1
-        elif pixel == secondColor:
-            color2 += 1
-
-    # return the color that appears least
-    if color1 > color2:
-        return secondColor, color2
-    elif color1 < color2:
-        return firstColor, color1
-    else:
-        print('Even color distribution\n')
-        return firstColor, color1 #unlikely edge case color returned doesnt matter since equal
+logging.basicConfig(
+    format="%(levelname)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 
-#############################################
-#
-# inputs
-# - image object
-#
-# turn in the image into an RGB list
-#
-#############################################
-def toArr(image):
-
-    colorArr = []
-    
-    for pixel in image.getdata():
-        if pixel == (255,255,255):
-            pixel = (254,254,254)
-        colorArr.append(pixel)
-    
-    return colorArr
-
-#############################################
-#
-# inputs
-# - image object
-#
-# turn in the message image into an RGB list
-#
-#############################################
-def toArrMessage(image): # possibly merge with toArr() function -- similar functionality
-
-    pixelArr = []
-
-    for pixel in image.getdata():
-        if pixel == 0 or pixel == (0,0,0):
-            pixelArr.append((0,0,0))
-        elif pixel == 1 or pixel == 255 or pixel == (255,255,255):
-            pixelArr.append((255,255,255))
-
-    return pixelArr
-
-#############################################
-#
-# inputs
-# - RGB list
-#
-# split the RGB value and append each value
-# seperately to a new list
-#
-#############################################
-def toBytes(colorArr): # sidenote - not actually bytes but sets up for bytes()
-    imArr = []
-    for i in colorArr:
-        r1,g1,b1 = i
-        imArr.append(r1)
-        imArr.append(g1)
-        imArr.append(b1)
-    return imArr
+def bit_depth_for_threshold(n: int) -> int:
+    """Return the number of low bits needed to represent threshold n."""
+    return max(math.ceil(math.log2(n + 1)), 1)
 
 
-#############################################
-#
-# inputs
-# - image object
-#
-# Checks if the image is a true 2 color image
-#
-#############################################
-def checkTwoColor(image):
+def binarize(grayscale: Image.Image) -> Image.Image:
+    """Convert a grayscale image to a binary mask (mode 'L', values 0 or 255).
 
-    cWidth, cHeight = image.size
+    Dark pixels (< BINARIZE_CUTOFF) become 255 (foreground).
+    Light pixels become 0 (background).
+    """
+    return grayscale.point(lambda v: 255 if v < BINARIZE_CUTOFF else 0)
 
-    numPixels = cWidth*cHeight
 
-    color1, color2 = 0, 0
+def encode(cover_path: str, message_path: str, output_path: str, n: int) -> None:
+    """Encode a message image into a cover image.
 
-    # grab a pixel and store its color
-    firstColor = image.getdata()[1]
+    Works by manipulating only the lowest `bit_depth` bits of each channel:
+    - Non-message pixels: low bits are normalized to >= n
+    - Message pixels: one channel's low bits are set to n-1 (below threshold)
 
-    # find a pixel of a different color
-    for pixel in image.getdata():
+    Maximum change per channel = (2^bit_depth - 1), ensuring imperceptibility.
+    """
+    bits = bit_depth_for_threshold(n)
+    mask = (1 << bits) - 1
 
-        if pixel != firstColor:
-            secondColor = pixel
-            break
+    log.info("Loading cover image: %s", cover_path)
+    cover = Image.open(cover_path).convert("RGB")
 
-    # count the pixels of each color
-    for pixel in image.getdata():
+    log.info("Loading message image: %s", message_path)
+    message = Image.open(message_path).convert("L")
 
-        if pixel == firstColor:
-            color1 += 1
-        elif pixel == secondColor:
-            color2 += 1
+    # Resize message to match cover dimensions
+    if message.size != cover.size:
+        log.info(
+            "Resizing message from %dx%d to %dx%d",
+            message.width, message.height, cover.width, cover.height,
+        )
+        message = message.resize(cover.size, Image.Resampling.LANCZOS)
 
-    if( (color1 + color2) != numPixels):
-        return False
-    else:
-        return True
+    # Binarize: dark pixels become foreground (255), light become background (0)
+    msg_mask = binarize(message)
+    mask_bytes = msg_mask.tobytes()
 
-#############################################
-#
-# inputs
-# - image object
-#
-# change color image to B&W
-#
-#############################################
-def toBW(image):
+    cover_bytes = bytearray(cover.tobytes())
+    num_pixels = cover.width * cover.height
+    embedded_count = 0
 
-    imArr = toArr(image)
+    log.info(
+        "Encoding (threshold=%d, bit_depth=%d, max_change=%d)...",
+        n, bits, mask,
+    )
 
-    imSize = image.size
+    sentinel = n - 1  # value to embed in low bits for message pixels
 
-    for i in range(0,len(imArr)):
-        r,g,b = imArr[i]
-        if((r+g+b) < 384):
-            imArr[i] = (0,0,0)
+    for i in range(num_pixels):
+        base = i * 3
+        r = cover_bytes[base]
+        g = cover_bytes[base + 1]
+        b = cover_bytes[base + 2]
+
+        # Extract low bits
+        r_low = r & mask
+        g_low = g & mask
+        b_low = b & mask
+
+        if mask_bytes[i]:  # message foreground pixel
+            # Pick the channel whose low bits are closest to sentinel (n-1)
+            # to minimize the visual change
+            diffs = [abs(r_low - sentinel), abs(g_low - sentinel), abs(b_low - sentinel)]
+            best = diffs.index(min(diffs))
+
+            # Set that channel's low bits to sentinel (below threshold)
+            if best == 0:
+                cover_bytes[base] = (r & ~mask) | sentinel
+            elif best == 1:
+                cover_bytes[base + 1] = (g & ~mask) | sentinel
+            else:
+                cover_bytes[base + 2] = (b & ~mask) | sentinel
+
+            # Normalize the OTHER two channels (low bits >= n)
+            for c, low in [(base, r_low), (base + 1, g_low), (base + 2, b_low)]:
+                if c == base + best:
+                    continue  # skip the embedded channel
+                if low < n:
+                    cover_bytes[c] = (cover_bytes[c] & ~mask) | n
+
+            embedded_count += 1
         else:
-            imArr[i] = (255,255,255)
-    #bytesArr = bytes(toBytes(imArr))
-    #stegImage = Image.frombytes("RGB", imSize, bytesArr)
-    #stegImage.show()
-    
-    return imArr
+            # Non-message pixel: normalize all channels (low bits >= n)
+            if r_low < n:
+                cover_bytes[base] = (r & ~mask) | n
+            if g_low < n:
+                cover_bytes[base + 1] = (g & ~mask) | n
+            if b_low < n:
+                cover_bytes[base + 2] = (b & ~mask) | n
+
+    result = Image.frombytes("RGB", cover.size, bytes(cover_bytes))
+    result.save(output_path, format="PNG")
+
+    total = num_pixels
+    pct = embedded_count / total * 100
+    log.info(
+        "Embedded %d/%d pixels (%.1f%%) into %s",
+        embedded_count, total, pct, output_path,
+    )
 
 
-#############################################
-#
-# inputs
-# - list of seperated RGB values
-# - size in shape (width, height)
-#
-# create the image from the list and dispay it
-#
-#############################################
-def showImage(arr, size): # not used but im scared to delete it -- good template
-    bytesArr = bytes(arr)
-    newImage = Image.frombytes("RGB", size, bytesArr)
-    newImage.show()
+def decode(input_path: str, output_path: str, n: int) -> None:
+    """Decode a hidden message from a stego image.
+
+    Any pixel where at least one channel's low bits are < n is a message pixel.
+    """
+    bits = bit_depth_for_threshold(n)
+    mask = (1 << bits) - 1
+
+    log.info("Loading stego image: %s", input_path)
+    stego = Image.open(input_path).convert("RGB")
+    stego_bytes = stego.tobytes()
+
+    num_pixels = stego.width * stego.height
+    out_bytes = bytearray(b"\xff" * num_pixels * 3)  # start with white
+    found_count = 0
+
+    log.info("Extracting message (threshold=%d, bit_depth=%d)...", n, bits)
+    for i in range(num_pixels):
+        base = i * 3
+        r = stego_bytes[base]
+        g = stego_bytes[base + 1]
+        b = stego_bytes[base + 2]
+
+        if (r & mask) < n or (g & mask) < n or (b & mask) < n:
+            out_bytes[base] = 0
+            out_bytes[base + 1] = 0
+            out_bytes[base + 2] = 0
+            found_count += 1
+
+    result = Image.frombytes("RGB", stego.size, bytes(out_bytes))
+    result.save(output_path, format="PNG")
+
+    log.info("Extracted %d message pixels to %s", found_count, output_path)
 
 
-#############################################
-#
-# inputs
-# - color least found in 2 color message image
-# - coverImage image object
-# - messageImage image object
-#
-# hide the message image in the cover image
-#
-#############################################
-def hideImage(leastColor, coverImage, messageImage):
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="steg",
+        description="Threshold-based image steganography — hides a message image "
+        "inside a cover image by manipulating low-order bits.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    # convert images to lists of RGB values
-    coverArr = toArr(coverImage)
-    messageArr = toArrMessage(messageImage)
+    # encode
+    enc = sub.add_parser("encode", help="Hide a message image inside a cover image")
+    enc.add_argument("--cover", "-c", required=True, help="Path to the cover image")
+    enc.add_argument("--message", "-m", required=True, help="Path to the message image")
+    enc.add_argument("--output", "-o", required=True, help="Output path (.png)")
+    enc.add_argument(
+        "--threshold", "-n", type=int, default=DEFAULT_THRESHOLD,
+        help=f"Low-bit threshold (default: {DEFAULT_THRESHOLD}). "
+        "Higher = more bit depth used, slightly more visible but more robust.",
+    )
 
+    # decode
+    dec = sub.add_parser("decode", help="Extract the hidden message from a stego image")
+    dec.add_argument("--input", "-i", required=True, help="Path to the stego image")
+    dec.add_argument("--output", "-o", required=True, help="Output path for revealed message (.png)")
+    dec.add_argument(
+        "--threshold", "-n", type=int, default=DEFAULT_THRESHOLD,
+        help=f"Threshold used during encoding (default: {DEFAULT_THRESHOLD})",
+    )
 
-    mSize = messageImage.size # sizeof(messageImage)
-
-
-    # extract from tuple
-    width, height = mSize
-
-    # cast to strings to left pas with zeros
-    width = str(width)
-    width = width.zfill(4)
-    height = str(height)
-    height = height.zfill(4)
-
-
-    # holds the indexes of the leastColor in messageImage
-    indexes = []
-
-    # leastColor needs to be full RGB value
-    if leastColor == 0:
-        leastColor = (0,0,0)
-    elif leastColor == 1 or leastColor == 255:
-        leastColor = (255,255,255)
-
-    # fill indexes[] with positions of least color in messageImage
-    count = 0
-    for pixel in messageArr:
-        count = count + 1
-        if pixel == leastColor:
-            indexes.append(count)
+    return parser
 
 
-    # in list of coverImage RGB values at indexes[] positions change to leastColor
-    for index in indexes:
-        coverArr[index] = leastColor
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
 
-    # turn width & height into 4 2-digit nums for 
-    w1 = int(width[:2])
-    w2 = int(width[2:])
-    h1 = int(height[:2])
-    h2 = int(height[2:])
+    # Validate threshold
+    if args.threshold < 2:
+        parser.error("Threshold must be >= 2")
+    if args.threshold > 128:
+        parser.error("Threshold must be <= 128")
 
-    # length of list
-    length = len(coverArr)
+    bits = bit_depth_for_threshold(args.threshold)
+    max_change = (1 << bits) - 1
+    if max_change > 15:
+        log.warning(
+            "Threshold %d requires %d-bit depth (max change per channel: %d). "
+            "Changes may be noticeable.",
+            args.threshold, bits, max_change,
+        )
 
-    # replace last two pixel tuples with width and height
-    coordinates = (w2,h1,h2)
-    coverArr[length-1] = coordinates
-    foo, bar, temp = coverArr[(length-2)]
-    coordinates = (foo,bar, w1)
-    coverArr[(length-2)] = coordinates
+    # Validate output format
+    output_path = Path(args.output)
+    if output_path.suffix.lower() != ".png":
+        parser.error(
+            f"Output must be a .png file (got '{output_path.suffix}'). "
+            "Lossy formats like JPEG will destroy the hidden message."
+        )
 
-    # show and save image
-    bytesArr = bytes(toBytes(coverArr))
-    stegImage = Image.frombytes("RGB", coverImage.size, bytesArr)
-    stegImage.show()
-    stegImage.save("steg.bmp")
+    if args.command == "encode":
+        for path, label in [(args.cover, "Cover"), (args.message, "Message")]:
+            if not Path(path).is_file():
+                parser.error(f"{label} image not found: {path}")
+        encode(args.cover, args.message, str(output_path), args.threshold)
 
-#############################################
-#
-# inputs
-# - image object
-#
-# hidden data is either black or white so 
-# scan the image and return the color with
-# the greater count this will be the hidden 
-# data to be extracted
-#
-# returns True if black and False if white
-#
-#############################################
-def findExtract(image): # this works but is it ideal? What if hiding red? If shading works irrelevant?
-    countBlack = 0
-    countWhite = 0
-
-    for pixel in image.getdata():
-        if(pixel == (0,0,0) or pixel == 0):
-            countBlack = countBlack + 1
-        elif(pixel == (255,255,255) or pixel == 255):
-            countWhite = countWhite + 1
-    if countBlack > countWhite: return True
-    if countWhite > countBlack: return False
-
-#############################################
-#
-# inputs
-# - image object
-# - bg background color for the image
-# - hWidth width of image to be extracted
-# - hHeight height of image to be extracted
-#
-# create a new image using the hidden data 
-# in the image, this image should be the
-# same as the message image originally
-# hidden in the cover image 
-#
-#############################################
-def revealImg(image):
-    
-    size = getHiddenSize(image)
-
-    hWidth, hHeight = size
-
-    count = 0
-    indexes = []
-
-    # default hidden color is black
-    imgPixels = (0,0,0)
-
-    # default background is white
-    bg = (255,255,255)
-
-    # if hidden pixels are black get indexes of all black pixels in cover
-    if(findExtract(image) == True):
-        for pixel in image.getdata():
-            count = count + 1
-            if pixel == (0,0,0):
-                indexes.append(count)
-    # if hidden pixels are white get indexes of all white pixels in cover
-    elif(findExtract(image) == False):
-        bg = (0,0,0)
-        imgPixels = (255,255,255)
-        for pixel in image.getdata():
-            count = count + 1
-            if pixel == (255,255,255):
-                indexes.append(count)
-    
-
-    
-    # create the list that will construct the image background
-    newImageArr = [bg]*hWidth*hHeight
-
-    # for all the pixels of hidden color that would fit in the hidden image
-    # plot them onto the background that was created
-    for index in indexes:
-        if index < len(newImageArr):
-            newImageArr[index] = imgPixels
-            
-    
-    # create the image, show it, and save it
-    bytesArr = bytes(toBytes(newImageArr))
-    stegImage = Image.frombytes("RGB", size, bytesArr)
-    stegImage.show()
-    stegImage.save("hiddenImage.bmp") # FUTURE IDEA ***** read in a name for this on the CLI -- not a priority
+    elif args.command == "decode":
+        if not Path(args.input).is_file():
+            parser.error(f"Input image not found: {args.input}")
+        decode(args.input, str(output_path), args.threshold)
 
 
-#############################################
-#
-# inputs
-# - image object (open)
-#
-# extract the width x height from the image 
-# found in the last two pixels
-#
-#############################################
-def getHiddenSize(image):
-
-    #convert image to a list
-    imArr = toArr(image)
-
-    # variable for the length of the list
-    length = len(imArr)
-
-    # last item in the list
-    size = imArr[length-1]
-    # second to last item in the list
-    size1 = imArr[length-2]
-
-    #split into individual numbers from tuple
-    w2,h1,h2 = size
-    foo, bar, w1 = size1
-
-    # concat individual numbers into width and heighy
-    width = int(str(w1)+str(w2))
-    height = int(str(h1)+str(h2))
-
-    # create a tuple of size 
-    dimensions = (width,height)
-
-    return dimensions
-
-
-    
-
-
-#############################################
-#
-# Main for running program
-#
-#############################################
-def main():
-
-    flag = 99
-
-    try:
-        # help message shown if passed -h or -help
-        if (argv[1] == "-h" or argv[1] == "-help"):
-            print(" _____ _______ ______ _____ ")
-            print("/ ____|__   __|  ____/ ____|")
-            print("| (___   | |  | |__ | |  __ ")
-            print(" \___ \  | |  |  __|| | |_ |")
-            print(" ____) | | |  | |___| |__| |")
-            print("|_____/  |_|  |______\_____|")
-            print("\nHIDE ----------------")
-            print("This is indicated by the -hide flag")
-            print("-cover indicates the cover image")
-            print("-message indicates the message image to be hidden")
-            print("Usage: project.py -hide -cover <cover image> -message <message image>\n")
-            print("EXTRACTION ----------------")
-            print("This is indicated by the -extract flag")
-            print("The image follows the -extract")
-            print("Usage: project.py -extract <image> \n")
-            exit()
-                
-        else:
-
-            # read in args based on flags from CLI
-            for i in range(len(argv)):
-                # hiding will be done
-                if argv[i] == "-hide":
-                    flag = 0 # flag swicthed to indicate hiding 
-
-                    
-                # read cover image
-                if argv[i] == "-cover":
-                    cover = argv[i+1]
-
-                # read message image
-                if argv[i] == "-message":
-                    # store args in vars
-                    twoColorImage = argv[i+1]
-                        
-                # image extracting is to be done
-                if argv[i] == "-extract":
-                    flag = 1 # flag to indicate extracting
-                    img = argv[i+1] # image to extract informatrion from
-
-                        
-
-        # if hiding is to be accomplished
-        if(flag == 0):
-            # open necessary images 
-            coverImage = Image.open(cover)
-            messageImage = Image.open(twoColorImage)
-
-            # store image sizes into vars
-            cWidth, cHeight = coverImage.size
-            mWidth, mHeight = messageImage.size
-            mSize = messageImage.size
-
-            # ensure the message image is a true 2-color image
-            # if not make it one
-            if(checkTwoColor(messageImage) != True):
-                imArr = toBW(messageImage)
-                messageImage.close()
-                bytesArr = bytes(toBytes(imArr))
-                messageImage = Image.frombytes("RGB", mSize, bytesArr)
-            
-
-            # value of the least present color in two color image
-            # the count of that color in the image // currently unused but saved for future versions
-            leastColor, leastColorCount = countPixels(messageImage)
-
-
-            # ensure picture sizes are compatible
-            if ((cWidth-2 < mWidth) or (cHeight-2 < mHeight)):
-                print("\n\nYour cover image must be greater than or equal to your message image in both height and width.\n\n")
-                exit() 
-
-            
-
-            # hide the message image in the cover
-            # FUTURE IDEA ***** use CLI to takein name of output image and pass to hideImage()
-            hideImage(leastColor, coverImage, messageImage)
-
-            # close images after operations      
-            coverImage.close()
-            messageImage.close()
-
-        # reveal the hidden message image from the cover and save
-        elif(flag == 1 ):
-            stegImg = Image.open(img)
-            revealImg(stegImg)
-            stegImg.close()
-        else:
-            print("Please indicate hiding or extracting: -help for more information")
-    except:
-        print("Use -help for more information")
-
-
-
-main()
+if __name__ == "__main__":
+    main()

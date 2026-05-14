@@ -1,5 +1,9 @@
-from PIL import Image  # need to install pillow library for this to work
+from PIL import Image  # requires the Pillow library
 from sys import argv
+
+if len(argv) != 2:
+    print("Usage: python count_pixels.py <image>")
+    raise SystemExit(1)
 
 CheckImage = argv[1]
 image = Image.open(CheckImage)

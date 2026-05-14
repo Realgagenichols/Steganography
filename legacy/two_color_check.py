@@ -1,6 +1,9 @@
 from PIL import Image
 from sys import argv
 
+if len(argv) != 2:
+    print("Usage: python two_color_check.py <image>")
+    raise SystemExit(1)
 
 twoColorImage = argv[1]
 image = Image.open(twoColorImage)
