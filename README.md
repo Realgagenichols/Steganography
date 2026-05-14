@@ -1,6 +1,6 @@
 # Steganography
 
-Hide a message image inside a cover image so the result looks visually identical to the cover.
+> A study project — hiding an image inside another image so the result looks visually identical to the cover.
 
 This repo started as a study project — I wrote a few rough scripts to teach myself the basic idea (`legacy/`), then revisited it later with a more general approach (the code at the repo root). Both are kept here.
 
